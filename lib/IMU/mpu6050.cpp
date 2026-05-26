@@ -350,14 +350,11 @@ void imu_task(void *pvParameters){
         IMU_GetEulerAngle(&imu, &euler_angle, dt);
 
         if (millis() - last_log_ms >= 1000) {
-            Serial.print("Roll: ");
-            Serial.print(euler_angle.roll, 2);
-
-            Serial.print("  Pitch: ");
-            Serial.print(euler_angle.pitch, 2);
-
-            Serial.print("  Yaw: ");
-            Serial.println(euler_angle.yaw, 2);
+            Serial.printf("Roll: %.2f  Pitch: %.2f  Yaw: %.2f\n",
+                euler_angle.roll,
+                euler_angle.pitch,
+                euler_angle.yaw
+            );
 
             last_log_ms = millis();
         }
