@@ -349,7 +349,7 @@ void imu_task(void *pvParameters){
         // ================= MAHONY AHRS =================
         IMU_GetEulerAngle(&imu, &euler_angle, dt);
 
-        if (millis() - last_log_ms >= 1000) {
+        if (millis() - last_log_ms >= 500) {
             Serial.printf("Roll: %.2f  Pitch: %.2f  Yaw: %.2f\n",
                 euler_angle.roll,
                 euler_angle.pitch,
