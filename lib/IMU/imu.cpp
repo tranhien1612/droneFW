@@ -1,114 +1,304 @@
 #include "imu.h"
 
-//Mahony AHRS
+#include <Arduino.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-/* Three constants used for Euler angle conversion */
-float RtA = 57.2957795f; // Radians -> Degrees (180/π)
-float Gyro_G = 4000.0f / 65536.0f; // Initial gyroscope range ±2000 degrees/s 1/(65536 / 4000) = 0.03051756*2
-float Gyro_Gr = 4000.0f / 65536.0f / 180.0f * 3.1415926f; // Degrees/s to Radians/s
-static float normAccz;
+#include "imu_filter.h"
+#include "mpu6050.h"
 
-/**
-* @brief Quick inverse square root 1/sqrt(num)
-* @param number Input value
-* @return 1/sqrt(number)
-*/
-static float Q_rsqrt(float number){
-    long i;
-    float x2, y;
-    const float threehalfs = 1.5F;
+#define IMU_TASK_PERIOD_MS 4
+#define IMU_TASK_STACK_WORDS 4096
+#define IMU_TASK_PRIORITY 4
+#define IMU_TASK_CORE 1
 
-    x2 = number * 0.5F;
-    y = number;
-    i = *(long *)&y;
-    i = 0x5f3759df - (i >> 1);
-    y = *(float *)&i;
-    y = y * (threehalfs - (x2 * y * y)); // 1st iteration: Newton's iteration method
-    return y;
+static ImuConfig imu_config;
+static ImuFilterState imu_filter;
+static ImuData imu_snapshot;
+static ImuStats imu_stats;
+static TaskHandle_t imu_task_handle = nullptr;
+static portMUX_TYPE imu_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool imu_reset_requested = false;
+static bool imu_started = false;
+static bool imu_filter_config_pending = false;
+static float pending_trim_roll_deg = 0.0f;
+static float pending_trim_pitch_deg = 0.0f;
+static float pending_yaw_deadband_dps = 0.0f;
+static bool pending_invert_yaw = false;
+
+static void apply_pending_filter_config()
+{
+    float trim_roll;
+    float trim_pitch;
+    float yaw_deadband;
+    bool invert_yaw;
+    bool pending;
+
+    portENTER_CRITICAL(&imu_mux);
+    pending = imu_filter_config_pending;
+    trim_roll = pending_trim_roll_deg;
+    trim_pitch = pending_trim_pitch_deg;
+    yaw_deadband = pending_yaw_deadband_dps;
+    invert_yaw = pending_invert_yaw;
+    imu_filter_config_pending = false;
+    portEXIT_CRITICAL(&imu_mux);
+
+    if (pending) {
+        IMU_FilterSetConfig(&imu_filter, trim_roll, trim_pitch, invert_yaw, yaw_deadband);
+    }
 }
 
+static bool update_once_with_dt(float dt_s)
+{
+    ImuRaw raw = {0};
+    ImuData next = {0};
 
-void IMU_GetEulerAngle(Gyro_Accel_Struct *gyroAccel,
-                              Euler_struct *eulerAngle,
-                              float dt){
-    volatile struct V{
-        float x;
-        float y;
-        float z;
-    } Gravity, Acc, Gyro, AccGravity;
+    apply_pending_filter_config();
 
-    static struct V GyroIntegError = {0};
-    static float KpDef = 0.8f;
-    static float KiDef = 0.0003f;
-    static Quaternion_Struct NumQ = {1, 0, 0, 0};
-    float q0_t, q1_t, q2_t, q3_t;
-    float NormQuat;
-    float HalfTime = dt * 0.5f;
+    const uint32_t start_us = micros();
+    const bool ok = MPU6050_ReadRaw(&raw);
 
-    // Get the gravity vector in the current attitude solution
-    Gravity.x = 2 * (NumQ.q1 * NumQ.q3 - NumQ.q0 * NumQ.q2);
-    Gravity.y = 2 * (NumQ.q0 * NumQ.q1 + NumQ.q2 * NumQ.q3);
-    Gravity.z = 1 - 2 * (NumQ.q1 * NumQ.q1 + NumQ.q2 * NumQ.q2);
-
-    // Acceleration normalization
-    NormQuat = Q_rsqrt(squa(gyroAccel->accel.accel_x) +
-                       squa(gyroAccel->accel.accel_y) +
-                       squa(gyroAccel->accel.accel_z));
-
-    Acc.x = gyroAccel->accel.accel_x * NormQuat;
-    Acc.y = gyroAccel->accel.accel_y * NormQuat;
-    Acc.z = gyroAccel->accel.accel_z * NormQuat;
-
-    // Cross product yields the error
-    AccGravity.x = (Acc.y * Gravity.z - Acc.z * Gravity.y);
-    AccGravity.y = (Acc.z * Gravity.x - Acc.x * Gravity.z);
-    AccGravity.z = (Acc.x * Gravity.y - Acc.y * Gravity.x);
-
-    // Integrate to obtain gyroscope deviation
-    GyroIntegError.x += AccGravity.x * KiDef;
-    GyroIntegError.y += AccGravity.y * KiDef;
-    GyroIntegError.z += AccGravity.z * KiDef;
-
-    // Gyroscope fusion accelerometer deviation value
-    Gyro.x = gyroAccel->gyro.gyro_x * Gyro_Gr + KpDef * AccGravity.x + GyroIntegError.x;
-    Gyro.y = gyroAccel->gyro.gyro_y * Gyro_Gr + KpDef * AccGravity.y + GyroIntegError.y;
-    Gyro.z = gyroAccel->gyro.gyro_z * Gyro_Gr + KpDef * AccGravity.z + GyroIntegError.z;
-
-    // First-order Longokuta method, updating quaternions
-    q0_t = (-NumQ.q1 * Gyro.x - NumQ.q2 * Gyro.y - NumQ.q3 * Gyro.z) * HalfTime;
-    q1_t = (NumQ.q0 * Gyro.x - NumQ.q3 * Gyro.y + NumQ.q2 * Gyro.z) * HalfTime;
-    q2_t = (NumQ.q3 * Gyro.x + NumQ.q0 * Gyro.y - NumQ.q1 * Gyro.z) * HalfTime;
-    q3_t = (-NumQ.q2 * Gyro.x + NumQ.q1 * Gyro.y + NumQ.q0 * Gyro.z) * HalfTime;
-
-    NumQ.q0 += q0_t;
-    NumQ.q1 += q1_t;
-    NumQ.q2 += q2_t;
-    NumQ.q3 += q3_t;
-
-    // Quaternion normalization
-    NormQuat = Q_rsqrt(squa(NumQ.q0) + squa(NumQ.q1) + squa(NumQ.q2) + squa(NumQ.q3));
-    NumQ.q0 *= NormQuat;
-    NumQ.q1 *= NormQuat;
-    NumQ.q2 *= NormQuat;
-    NumQ.q3 *= NormQuat;
-
-    /* Calculate the Z-axis components in the geographic system */
-    float vecxZ = 2 * NumQ.q0 * NumQ.q2 - 2 * NumQ.q1 * NumQ.q3;
-    float vecyZ = 2 * NumQ.q2 * NumQ.q3 + 2 * NumQ.q0 * NumQ.q1;
-    float veczZ = 1 - 2 * NumQ.q1 * NumQ.q1 - 2 * NumQ.q2 * NumQ.q2;
-
-    float yaw_G = gyroAccel->gyro.gyro_z * Gyro_G; //Convert the original Z-axis angular velocity value to Z angle/s
-    if ((yaw_G > 0.5f) || (yaw_G < -0.5f))        // If the value is too small, it is considered noise and the yaw angle is not updated.
-    {
-        eulerAngle->yaw += yaw_G * dt; // Integral angular velocity to yaw angle
+    if (ok) {
+        IMU_FilterUpdate(&imu_filter, &raw, dt_s, &next);
+        next.healthy = true;
+    } else {
+        portENTER_CRITICAL(&imu_mux);
+        next = imu_snapshot;
+        portEXIT_CRITICAL(&imu_mux);
+        next.healthy = false;
     }
 
-    eulerAngle->pitch = asin(vecxZ) * RtA; // Pitch angle
-    eulerAngle->roll = atan2f(vecyZ, veczZ) * RtA; // Roll angle
+    next.update_us = micros() - start_us;
 
-    normAccz = gyroAccel->accel.accel_x * vecxZ + gyroAccel->accel.accel_y * vecyZ + gyroAccel->accel.accel_z * veczZ;
+    portENTER_CRITICAL(&imu_mux);
+    imu_snapshot = next;
+    imu_stats.read_count++;
+    imu_stats.last_update_ms = millis();
+    imu_stats.read_time_us = next.update_us;
+    if (next.update_us > imu_stats.max_read_time_us) {
+        imu_stats.max_read_time_us = next.update_us;
+    }
+    if (ok) {
+        imu_stats.consecutive_fail_count = 0;
+        imu_stats.last_ok_ms = millis();
+    } else {
+        imu_stats.fail_count++;
+        imu_stats.consecutive_fail_count++;
+    }
+    imu_stats.task_running = imu_task_handle != nullptr;
+    imu_stats.healthy = ok;
+    portEXIT_CRITICAL(&imu_mux);
+
+    return ok;
 }
 
-float IMU_GetNormAccZ(void){
-    return normAccz;
+static void imu_task(void *parameter)
+{
+    (void)parameter;
+
+    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t last_us = micros();
+
+    for (;;) {
+        if (imu_reset_requested) {
+            IMU_FilterReset(&imu_filter);
+            imu_reset_requested = false;
+        }
+
+        const uint32_t now_us = micros();
+        float dt_s = (now_us - last_us) * 1e-6f;
+        last_us = now_us;
+
+        update_once_with_dt(dt_s);
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(IMU_TASK_PERIOD_MS));
+    }
+}
+
+bool IMU_Begin(const ImuConfig *config)
+{
+    if (config == nullptr) {
+        return false;
+    }
+
+    imu_config = *config;
+
+    portENTER_CRITICAL(&imu_mux);
+    imu_snapshot = {};
+    imu_stats = {};
+    pending_trim_roll_deg = imu_config.trim_roll_deg;
+    pending_trim_pitch_deg = imu_config.trim_pitch_deg;
+    pending_yaw_deadband_dps = imu_config.yaw_deadband_dps;
+    pending_invert_yaw = imu_config.invert_yaw;
+    imu_filter_config_pending = false;
+    portEXIT_CRITICAL(&imu_mux);
+
+    IMU_FilterInit(&imu_filter, &imu_config);
+
+    if (!MPU6050_Init(imu_config.sda_pin, imu_config.scl_pin, imu_config.i2c_clock)) {
+        return false;
+    }
+
+    imu_started = true;
+    return true;
+}
+
+bool IMU_StartTask(void)
+{
+    if (!imu_started) {
+        return false;
+    }
+
+    if (imu_task_handle != nullptr) {
+        return true;
+    }
+
+    const bool ok = xTaskCreatePinnedToCore(
+        imu_task,
+        "imu_task",
+        IMU_TASK_STACK_WORDS,
+        nullptr,
+        IMU_TASK_PRIORITY,
+        &imu_task_handle,
+        IMU_TASK_CORE
+    ) == pdPASS;
+
+    if (ok) {
+        portENTER_CRITICAL(&imu_mux);
+        imu_stats.task_running = true;
+        portEXIT_CRITICAL(&imu_mux);
+    }
+
+    return ok;
+}
+
+bool IMU_UpdateOnce(void)
+{
+    static uint32_t last_us = 0;
+    const uint32_t now_us = micros();
+    float dt_s = 0.004f;
+
+    if (last_us != 0) {
+        dt_s = (now_us - last_us) * 1e-6f;
+    }
+    last_us = now_us;
+
+    if (imu_reset_requested) {
+        IMU_FilterReset(&imu_filter);
+        imu_reset_requested = false;
+    }
+
+    return update_once_with_dt(dt_s);
+}
+
+bool IMU_GetData(ImuData *out)
+{
+    if (out == nullptr) {
+        return false;
+    }
+
+    portENTER_CRITICAL(&imu_mux);
+    *out = imu_snapshot;
+    portEXIT_CRITICAL(&imu_mux);
+
+    return out->healthy;
+}
+
+void IMU_GetStats(ImuStats *out)
+{
+    if (out == nullptr) {
+        return;
+    }
+
+    portENTER_CRITICAL(&imu_mux);
+    *out = imu_stats;
+    portEXIT_CRITICAL(&imu_mux);
+}
+
+void IMU_RequestReset(void)
+{
+    imu_reset_requested = true;
+}
+
+bool IMU_IsHealthy()
+{
+    ImuStats stats = {};
+    ImuData data = {};
+
+    portENTER_CRITICAL(&imu_mux);
+    stats = imu_stats;
+    data = imu_snapshot;
+    portEXIT_CRITICAL(&imu_mux);
+
+    if (!imu_started || !data.healthy) {
+        return false;
+    }
+
+    return (millis() - stats.last_ok_ms) < 100;
+}
+
+void IMU_SetTrim(float roll_deg, float pitch_deg)
+{
+    portENTER_CRITICAL(&imu_mux);
+    imu_config.trim_roll_deg = roll_deg;
+    imu_config.trim_pitch_deg = pitch_deg;
+    pending_trim_roll_deg = roll_deg;
+    pending_trim_pitch_deg = pitch_deg;
+    pending_invert_yaw = imu_config.invert_yaw;
+    pending_yaw_deadband_dps = imu_config.yaw_deadband_dps;
+    imu_filter_config_pending = true;
+    portEXIT_CRITICAL(&imu_mux);
+}
+
+void IMU_SetYawInvert(bool invert)
+{
+    portENTER_CRITICAL(&imu_mux);
+    imu_config.invert_yaw = invert;
+    pending_trim_roll_deg = imu_config.trim_roll_deg;
+    pending_trim_pitch_deg = imu_config.trim_pitch_deg;
+    pending_invert_yaw = invert;
+    pending_yaw_deadband_dps = imu_config.yaw_deadband_dps;
+    imu_filter_config_pending = true;
+    portEXIT_CRITICAL(&imu_mux);
+}
+
+void IMU_SetYawDeadband(float deadband_dps)
+{
+    if (deadband_dps < 0.0f) {
+        deadband_dps = 0.0f;
+    }
+
+    portENTER_CRITICAL(&imu_mux);
+    imu_config.yaw_deadband_dps = deadband_dps;
+    pending_trim_roll_deg = imu_config.trim_roll_deg;
+    pending_trim_pitch_deg = imu_config.trim_pitch_deg;
+    pending_invert_yaw = imu_config.invert_yaw;
+    pending_yaw_deadband_dps = deadband_dps;
+    imu_filter_config_pending = true;
+    portEXIT_CRITICAL(&imu_mux);
+}
+
+bool IMU_Recalibrate()
+{
+    if (!imu_started) {
+        return false;
+    }
+
+    if (imu_task_handle != nullptr) {
+        return false;
+    }
+
+    if (!MPU6050_Calibrate(800, 2)) {
+        return false;
+    }
+
+    IMU_RequestReset();
+
+    portENTER_CRITICAL(&imu_mux);
+    imu_stats.fail_count = 0;
+    imu_stats.consecutive_fail_count = 0;
+    imu_stats.max_read_time_us = 0;
+    portEXIT_CRITICAL(&imu_mux);
+
+    return true;
 }
