@@ -15,4 +15,6 @@ void IMU_SetTrim(float roll_deg, float pitch_deg);
 void IMU_SetYawInvert(bool invert);
 void IMU_SetYawDeadband(float deadband_dps);
 bool IMU_Recalibrate();
+const char *IMU_GetLastError(void);
+uint8_t IMU_GetDeviceAddress(void);
 #endif

@@ -302,3 +302,11 @@ bool IMU_Recalibrate()
 
     return true;
 }
+
+const char *IMU_GetLastError(void) {
+    return MPU6050_GetLastError();
+}
+
+uint8_t IMU_GetDeviceAddress(void) {
+    return MPU6050_GetAddress();
+}

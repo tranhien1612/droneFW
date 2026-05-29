@@ -2,7 +2,6 @@
 
 #include "config.h"
 #include "imu.h"
-#include "mpu6050.h"
 
 static bool imu_ready = false;
 
@@ -22,7 +21,7 @@ void setup()
     };
 
     if (!IMU_Begin(&imu_config)) {
-        Serial.printf("IMU init failed: %s\n", MPU6050_GetLastError());
+        Serial.printf("IMU init failed: %s\n", IMU_GetLastError());
         return;
     }
 
@@ -32,7 +31,7 @@ void setup()
     }
 
     imu_ready = true;
-    Serial.printf("IMU ready at I2C address 0x%02X\n", MPU6050_GetAddress());
+    Serial.printf("IMU ready at I2C address 0x%02X\n", IMU_GetDeviceAddress());
 }
 
 void loop()
